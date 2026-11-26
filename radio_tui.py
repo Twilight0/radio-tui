@@ -21,7 +21,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.2.0"
 CONFIG_DIR = Path.home() / ".config" / "radio-tui"
 FAV_FILE = CONFIG_DIR / "favorites.json"
 RECENT_FILE = CONFIG_DIR / "recent.json"
@@ -72,6 +72,43 @@ def _child_preexec(pgid=None):
             pass
         _set_pdeathsig(signal.SIGTERM)
     return _fn
+
+
+def _drain_stream(stream, sink):
+    """Read a child process' stderr into `sink` so the pipe never fills up
+    (a full stderr pipe would block the child)."""
+    if stream is None:
+        return
+    try:
+        while True:
+            chunk = stream.read(4096)
+            if not chunk:
+                break
+            sink.append(chunk)
+    except Exception:
+        pass
+
+
+YOUTUBE_HOSTS = (
+    "youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com",
+    "youtu.be", "www.youtu.be", "youtube-nocookie.com", "www.youtube-nocookie.com",
+)
+
+# Prefer the highest quality AAC (m4a) audio, then any mp4a stream, then
+# whatever else is available.
+YTDLP_FORMAT = "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio/best"
+
+# How long to wait for ffmpeg to open the input before considering it failed.
+OPEN_GRACE = 6.0
+
+
+def is_youtube_url(url):
+    """True for youtube.com / youtu.be links, which need yt-dlp."""
+    try:
+        host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    except Exception:
+        return False
+    return any(host == h or host.endswith("." + h) for h in YOUTUBE_HOSTS)
 
 
 def _http_get_text(url, timeout=10):
@@ -304,6 +341,7 @@ class RadioPlayer:
         self.state = "idle"
         self.station_name = ""
         self.error_msg = ""
+        self.source_note = ""
         atexit.register(self.stop)
 
     def _terminate(self, pgid, procs):
@@ -343,6 +381,7 @@ class RadioPlayer:
             self._procs = []
             self.state = "idle"
             self.error_msg = ""
+            self.source_note = ""
         self._terminate(pgid, procs)
 
     def play(self, station):
@@ -353,21 +392,187 @@ class RadioPlayer:
             self.state = "loading"
             self.station_name = station.get("name", "Radio")
             self.error_msg = ""
+            self.source_note = ""
         t = threading.Thread(target=self._worker, args=(gen, station), daemon=True)
         t.start()
 
-    def _worker(self, gen, station):
-        ff_proc = None
-        ap_proc = None
+    def _is_current(self, gen):
+        with self._lock:
+            return self._gen == gen
+
+    def _audio_sink(self):
+        """Return the playback command, or None if no sink is available."""
+        paplay_bin = None
+        if shutil.which("pactl"):
+            r = subprocess.run(["pactl", "info"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1.5)
+            if r.returncode == 0:
+                paplay_bin = shutil.which("paplay")
+        aplay_bin = shutil.which("aplay")
+        if paplay_bin:
+            return [paplay_bin, "--raw", "--format=s16le", "--rate=48000", "--channels=2",
+                    "--client-name=radio-tui"]
+        if aplay_bin:
+            return [aplay_bin, "-q", "-D", "default", "-f", "S16_LE", "-r", "48000", "-c", "2", "-t", "raw"]
+        return None
+
+    def _spawn(self, ff_bin, ap_cmd, url, producer_cmd):
+        """Spawn [producer]? -> ffmpeg -> audio sink.
+
+        Without a producer ffmpeg reads the URL itself.  With one (curl for
+        legacy SHOUTcast servers, yt-dlp for YouTube) the producer feeds raw
+        bytes into ffmpeg's stdin.
+        """
+        prod_proc = None
+        if producer_cmd is None:
+            ff_cmd = [
+                ff_bin, "-loglevel", "error",
+                "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
+                "-i", url,
+                "-vn", "-f", "s16le", "-ac", "2", "-ar", "48000", "pipe:1",
+            ]
+            ff_proc = subprocess.Popen(
+                ff_cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                preexec_fn=_child_preexec(),
+            )
+            leader = ff_proc.pid
+            procs = [ff_proc]
+        else:
+            prod_proc = subprocess.Popen(
+                producer_cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                preexec_fn=_child_preexec(),
+            )
+            ff_cmd = [
+                ff_bin, "-loglevel", "error",
+                "-i", "pipe:0",
+                "-vn", "-f", "s16le", "-ac", "2", "-ar", "48000", "pipe:1",
+            ]
+            ff_proc = subprocess.Popen(
+                ff_cmd, stdin=prod_proc.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                preexec_fn=_child_preexec(prod_proc.pid),
+            )
+            if prod_proc.stdout:
+                prod_proc.stdout.close()
+            leader = prod_proc.pid
+            procs = [prod_proc, ff_proc]
+
+        ap_proc = subprocess.Popen(
+            ap_cmd, stdin=ff_proc.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            preexec_fn=_child_preexec(leader),
+        )
+        if ff_proc.stdout:
+            ff_proc.stdout.close()
+
+        # Do the same setpgid from the parent side: the child's own setpgid
+        # may not have run yet, and a stop() in that window would killpg an
+        # empty group and leave the pipeline running.
         try:
-            ffmpeg_bin = shutil.which("ffmpeg")
-            paplay_bin = None
-            if shutil.which("pactl"):
-                r = subprocess.run(["pactl", "info"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1.5)
-                if r.returncode == 0:
-                    paplay_bin = shutil.which("paplay")
-            aplay_bin = shutil.which("aplay")
-            if not ffmpeg_bin or (not paplay_bin and not aplay_bin):
+            os.setpgid(leader, leader)
+        except Exception:
+            pass
+        for p in procs:
+            try:
+                os.setpgid(p.pid, leader)
+            except Exception:
+                pass
+        try:
+            os.setpgid(ap_proc.pid, leader)
+        except Exception:
+            pass
+        return leader, procs + [ap_proc], ff_proc, ap_proc, prod_proc
+
+    def _run_pipeline(self, gen, station, ff_bin, ap_cmd, url, producer_cmd, note):
+        """Run one playback pipeline and update the player state.
+
+        Returns a dict with "status" (playing / ended / failed_open / stale),
+        the captured stderr and whether the failure looks like a legacy
+        SHOUTcast (ICY) response.
+        """
+        try:
+            leader, procs, ff_proc, ap_proc, prod_proc = self._spawn(ff_bin, ap_cmd, url, producer_cmd)
+        except Exception as e:
+            with self._lock:
+                if self._gen == gen:
+                    self.state = "error"
+                    self.error_msg = str(e)[:80]
+            return {"status": "failed_open", "error": str(e), "icy": False}
+
+        ff_err = []
+        prod_err = []
+        threading.Thread(target=_drain_stream, args=(ff_proc.stderr, ff_err), daemon=True).start()
+        if prod_proc is not None:
+            threading.Thread(target=_drain_stream, args=(prod_proc.stderr, prod_err), daemon=True).start()
+
+        with self._lock:
+            if self._gen != gen:
+                stale = True
+            else:
+                stale = False
+                self._pgid = leader
+                self._procs = procs
+                self.state = "playing"
+                self.source_note = note
+                self.error_msg = ""
+        if stale:
+            self._terminate(leader, procs)
+            return {"status": "stale"}
+
+        # ffmpeg exits immediately when the input cannot be opened.  Watch for
+        # that early exit so the curl fallback can take over.
+        deadline = time.time() + OPEN_GRACE
+        while time.time() < deadline and ff_proc.poll() is None:
+            time.sleep(0.15)
+
+        if ff_proc.poll() is not None:
+            time.sleep(0.2)  # let the stderr drain threads catch up
+            ff_text = b"".join(ff_err).decode(errors="replace")
+            prod_text = b"".join(prod_err).decode(errors="replace")
+            rc = ff_proc.returncode
+            self._terminate(leader, procs)
+            icy = ("Malformed HTTP status line" in ff_text
+                   or "Invalid data found when processing input" in ff_text)
+            with self._lock:
+                if self._gen == gen:
+                    self._pgid = None
+                    self._procs = []
+                    self.source_note = ""
+                    if rc == 0:
+                        self.state = "idle"
+                    else:
+                        self.state = "error"
+                        detail = prod_text or ff_text
+                        lines = [l for l in detail.strip().splitlines() if l.strip()]
+                        self.error_msg = (lines[-1] if lines else f"ffmpeg exited {rc}")[:80]
+            return {"status": "ended" if rc == 0 else "failed_open",
+                    "error": ff_text, "icy": icy}
+
+        # Normal playback: wait for the sink to finish.
+        _, ap_err = ap_proc.communicate()
+        ff_proc.wait()
+        self._terminate(leader, procs)  # reap a producer that is still running
+        ff_text = b"".join(ff_err).decode(errors="replace")
+        prod_text = b"".join(prod_err).decode(errors="replace")
+        with self._lock:
+            if self._gen == gen:
+                if ap_proc.returncode not in (0, None, -signal.SIGTERM, -signal.SIGKILL):
+                    self.state = "error"
+                    self.error_msg = (ap_err or b"").decode(errors="replace").strip()[:80]
+                elif ff_proc.returncode not in (0, None, -signal.SIGTERM, -signal.SIGKILL):
+                    # The producer (yt-dlp) usually knows better what went wrong.
+                    lines = [l for l in (prod_text or ff_text).strip().splitlines() if l.strip()]
+                    self.state = "error"
+                    self.error_msg = (lines[-1] if lines else f"ffmpeg exited {ff_proc.returncode}")[:80]
+                else:
+                    self.state = "idle"
+                self._pgid = None
+                self._procs = []
+                self.source_note = ""
+        return {"status": "ended"}
+
+    def _worker(self, gen, station):
+        try:
+            ff_bin = shutil.which("ffmpeg")
+            ap_cmd = self._audio_sink()
+            if not ff_bin or not ap_cmd:
                 with self._lock:
                     if self._gen == gen:
                         self.state = "error"
@@ -375,68 +580,32 @@ class RadioPlayer:
                 return
 
             stream_url = resolve_stream_url(station)
-            ff_cmd = [
-                ffmpeg_bin, "-loglevel", "error",
-                "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
-                "-i", stream_url,
-                "-vn", "-f", "s16le", "-ac", "2", "-ar", "48000", "pipe:1",
-            ]
-            if paplay_bin:
-                ap_cmd = [paplay_bin, "--raw", "--format=s16le", "--rate=48000", "--channels=2", "--client-name=radio-tui"]
-            else:
-                ap_cmd = [aplay_bin, "-q", "-D", "default", "-f", "S16_LE", "-r", "48000", "-c", "2", "-t", "raw"]
 
-            ff_proc = subprocess.Popen(
-                ff_cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                preexec_fn=_child_preexec(),
-            )
-            ap_proc = subprocess.Popen(
-                ap_cmd, stdin=ff_proc.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                preexec_fn=_child_preexec(ff_proc.pid),
-            )
-            if ff_proc.stdout:
-                ff_proc.stdout.close()
-
-            # Do the same setpgid from the parent side: the child's own setpgid
-            # may not have run yet, and a stop() in that window would killpg an
-            # empty group and leave the pipeline running.
-            try:
-                os.setpgid(ff_proc.pid, ff_proc.pid)
-            except Exception:
-                pass
-            try:
-                os.setpgid(ap_proc.pid, ff_proc.pid)
-            except Exception:
-                pass
-
-            with self._lock:
-                if self._gen != gen:
-                    stale = True
-                else:
-                    stale = False
-                    self._pgid = ff_proc.pid
-                    self._procs = [ff_proc, ap_proc]
-                    self.state = "playing"
-            if stale:
-                self._terminate(ff_proc.pid, [ff_proc, ap_proc])
+            # YouTube links are not plain streams: yt-dlp resolves them and
+            # hands the best AAC audio to ffmpeg.
+            if is_youtube_url(stream_url):
+                yt_dlp = shutil.which("yt-dlp")
+                if not yt_dlp:
+                    with self._lock:
+                        if self._gen == gen:
+                            self.state = "error"
+                            self.error_msg = "YouTube URL needs yt-dlp (pip install yt-dlp)"
+                    return
+                producer = [yt_dlp, "-f", YTDLP_FORMAT, "--no-playlist", "-q", "-o", "-", stream_url]
+                self._run_pipeline(gen, station, ff_bin, ap_cmd, stream_url, producer, "yt-dlp")
                 return
 
-            _, ap_err = ap_proc.communicate()
-            ff_err = ff_proc.stderr.read() if ff_proc.stderr else b""
-            ff_proc.wait()
-            with self._lock:
-                if self._gen == gen:
-                    if ap_proc.returncode not in (0, None, -signal.SIGTERM, -signal.SIGKILL):
-                        self.state = "error"
-                        self.error_msg = (ap_err or b"").decode(errors="replace").strip()[:80]
-                    elif ff_proc.returncode not in (0, None, -signal.SIGTERM, -signal.SIGKILL):
-                        lines = (ff_err or b"").decode(errors="replace").strip().splitlines()
-                        self.state = "error"
-                        self.error_msg = (lines[-1] if lines else f"ffmpeg exited {ff_proc.returncode}")[:80]
-                    else:
-                        self.state = "idle"
-                    self._pgid = None
-                    self._procs = []
+            res = self._run_pipeline(gen, station, ff_bin, ap_cmd, stream_url, None, "")
+            # Legacy SHOUTcast servers answer with an "ICY 200 OK" line instead
+            # of an HTTP status line, which ffmpeg >= 9.1 refuses to parse.
+            # Retry through curl, which accepts that response.
+            if (res.get("status") == "failed_open" and res.get("icy")
+                    and self._is_current(gen)
+                    and stream_url.lower().startswith(("http://", "https://"))):
+                curl = shutil.which("curl")
+                if curl:
+                    producer = [curl, "-sS", "-N", "--http0.9", "--connect-timeout", "20", stream_url]
+                    self._run_pipeline(gen, station, ff_bin, ap_cmd, stream_url, producer, "curl")
         except Terminate:
             raise
         except Exception as e:
@@ -444,9 +613,6 @@ class RadioPlayer:
                 if self._gen == gen:
                     self.state = "error"
                     self.error_msg = str(e)[:80]
-            if ff_proc is not None or ap_proc is not None:
-                procs = [p for p in (ff_proc, ap_proc) if p is not None]
-                self._terminate(ff_proc.pid if ff_proc else None, procs)
 
 
 def _drain_input(stdscr, timeout=0.05, restore_timeout=250):
@@ -693,6 +859,8 @@ def main_curses(stdscr):
             # Player bar
             if player.state == "playing":
                 pcol, ptxt = 3, f"Playing: {player.station_name}"
+                if player.source_note:
+                    pcol, ptxt = 3, f"Playing: {player.station_name} ({player.source_note})"
             elif player.state == "loading":
                 pcol, ptxt = 2, f"Connecting: {player.station_name}..."
             elif player.state == "error":

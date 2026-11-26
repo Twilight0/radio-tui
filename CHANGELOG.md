@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.2.0 (2026-11-26)
+
+### Features
+
+- **Legacy SHOUTcast (ICY) streams play again:** ffmpeg 9.1 made its HTTP status-line parser strict, so servers that answer with the legacy `ICY 200 OK` line (Radio Caprice and friends) failed with *"Malformed HTTP status line"*. radio-tui now detects that failure and retries through `curl --http0.9`, which accepts the old response; the player bar shows `(curl)`.
+- **YouTube support via yt-dlp (optional):** manually entered YouTube links are resolved with `yt-dlp` and the best AAC audio (`bestaudio[ext=m4a]`, highest bitrate first) is streamed to the player. The player bar shows `(yt-dlp)`.
+
+### Fixes
+
+- The stderr of the player pipeline is drained continuously, so a chatty stream can no longer fill the pipe buffer and stall ffmpeg.
+- Errors from `yt-dlp` (for example *"Video unavailable"*) are shown instead of ffmpeg's generic message.
+
 ## v1.1.1 (2026-11-26)
 
 ### Fixes

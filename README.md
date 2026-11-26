@@ -11,6 +11,8 @@ Lightweight single-file Python curses internet radio player with zero Python thi
   - **Recent:** Stations you have played, remembered in `~/.config/radio-tui/recent.json` (most recent first).
 - **Client-Side Filtering:** Filter loaded lists by substring (`l`) and clear with `Esc`.
 - **Audio Output & Mixing:** Decodes streams with `ffmpeg` and plays via PulseAudio/PipeWire (`paplay`) or ALSA `default` (`aplay`, compatible with `dmix` and BlueALSA).
+- **Legacy SHOUTcast Support:** Stations on old SHOUTcast servers (which answer with `ICY 200 OK` instead of an HTTP status line, rejected by ffmpeg 9.1+) are retried through `curl --http0.9`.
+- **YouTube Playback (optional):** YouTube links added as custom URLs are resolved with `yt-dlp` and the best available AAC audio is played.
 - **Volume Control:** Adjust volume directly with `+`/`-` (`pactl`, `bluealsa-cli`, or `amixer`).
 
 ## Requirements
@@ -19,6 +21,8 @@ Lightweight single-file Python curses internet radio player with zero Python thi
 - `ffmpeg`
 - `aplay` (`alsa-utils`) or `paplay` (PulseAudio / PipeWire)
 - Optional: `pactl`, `bluealsa-cli`, or `amixer` for volume control
+- Optional: `curl` for legacy SHOUTcast streams (fallback for ffmpeg 9.1+)
+- Optional: `yt-dlp` for playing YouTube URLs
 
 ## Installation
 
@@ -41,7 +45,7 @@ python3 radio_tui.py
 | `s` | Stop playback |
 | `+` / `-` | Volume up / down |
 | `f` | Toggle favorite |
-| `a` | Add custom stream URL to Favorites |
+| `a` | Add custom stream URL to Favorites (YouTube links are played via `yt-dlp`) |
 | `l` | Filter current list (`Esc` to clear) |
 | `/` | Search stations by name |
 | `c` | Jump to country (or browse all if blank) |
