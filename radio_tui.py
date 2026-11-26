@@ -21,9 +21,11 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 CONFIG_DIR = Path.home() / ".config" / "radio-tui"
 FAV_FILE = CONFIG_DIR / "favorites.json"
+RECENT_FILE = CONFIG_DIR / "recent.json"
+RECENT_MAX = 50
 USER_AGENT = f"radio-tui/{APP_VERSION}"
 
 RADIO_BROWSER_HOSTS = [
@@ -212,6 +214,44 @@ def save_favorites(favs):
         FAV_FILE.write_text(json.dumps(favs, indent=2), encoding="utf-8")
     except Exception:
         pass
+
+
+def load_recent():
+    """Recently played stations, most recent first."""
+    try:
+        if RECENT_FILE.exists():
+            data = json.loads(RECENT_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return [s for s in data if isinstance(s, dict) and s.get("url")]
+    except Exception:
+        pass
+    return []
+
+
+def save_recent(stations):
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        RECENT_FILE.write_text(json.dumps(stations[:RECENT_MAX], indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def remember_station(station, recent):
+    """Move a station to the front of the recent list (in place)."""
+    if not station or not station.get("url"):
+        return
+    entry = {
+        "name": station.get("name", "Radio"),
+        "url": station.get("url", ""),
+        "country": station.get("country", ""),
+        "tags": station.get("tags", ""),
+        "bitrate": station.get("bitrate", ""),
+        "codec": station.get("codec", ""),
+    }
+    recent[:] = [s for s in recent if s.get("url") != entry["url"]]
+    recent.insert(0, entry)
+    del recent[RECENT_MAX:]
+    save_recent(recent)
 
 
 def adjust_volume(delta_pct=5):
@@ -459,7 +499,7 @@ def prompt_input(stdscr, prompt):
                 if buf:
                     buf.pop()
                 continue
-            if ch in (9, curses.KEY_TAB):
+            if ch in (9, curses.KEY_BTAB):
                 continue
             if ch < 0 or ch in (
                 curses.KEY_UP, curses.KEY_DOWN, curses.KEY_LEFT, curses.KEY_RIGHT,
@@ -495,12 +535,13 @@ def main_curses(stdscr):
     player = RadioPlayer()
     favs = load_favorites()
 
-    tabs = ["Favorites", "SomaFM", "Top World", "Countries", "Genres", "Search"]
+    tabs = ["Favorites", "SomaFM", "Top World", "Countries", "Genres", "Search", "Recent"]
     tab_idx = 1 if not favs else 0
     stations = list(favs) if tab_idx == 0 else []
+    recent = load_recent()
     idx = 0
     scroll = 0
-    msg = "Enter play/open  Tab/1-6 switch feed  / search  c country  g genre"
+    msg = "Enter play/open  Tab/1-7 switch feed  / search  c country  g genre"
     loading_list = False
     sub_label = ""
     page_size = 100
@@ -524,6 +565,8 @@ def main_curses(stdscr):
         if t_idx == 5:
             res = fetch_rb_search(arg or "radio", limit=page_size, offset=off)
             return res, len(res) >= page_size
+        if t_idx == 6:
+            return list(recent), False
         return [], False
 
     def load_tab(new_idx, arg=None):
@@ -540,6 +583,11 @@ def main_curses(stdscr):
         if tab_idx == 0:
             stations = list(favs)
             msg = f"Favorites: {len(stations)} station(s)"
+            return
+        if tab_idx == 6:
+            recent[:] = load_recent()
+            stations = list(recent)
+            msg = f"Recent: {len(stations)} station(s)" if stations else "Recent: no stations played yet"
             return
         loading_list = True
         msg = f"Loading {tabs[tab_idx]}" + (f" ({arg})" if arg else "") + "..."
@@ -566,7 +614,7 @@ def main_curses(stdscr):
 
     def load_more():
         nonlocal loading_list
-        if loading_list or not has_more or tab_idx in (0, 1):
+        if loading_list or not has_more or tab_idx in (0, 1, 6):
             return
         loading_list = True
         gen = load_gen
@@ -658,7 +706,7 @@ def main_curses(stdscr):
             status_msg = f"[filter: {filter_text}] {msg}" if filter_text else msg
             stdscr.addstr(h - 2, 1, status_msg[:w - 2])
             stdscr.attron(curses.color_pair(1))
-            stdscr.addstr(h - 1, 1, "Enter play/open  Esc back  l filter  s stop  +/- vol  f fav  a add  / search  c country  g genre  1-6/Tab  q quit"[:w - 2])
+            stdscr.addstr(h - 1, 1, "Enter play/open  Esc back  l filter  s stop  +/- vol  f fav  a add  / search  c country  g genre  1-7/Tab  q quit"[:w - 2])
             stdscr.attroff(curses.color_pair(1))
             stdscr.refresh()
 
@@ -701,7 +749,7 @@ def main_curses(stdscr):
                 msg = f"Filtered ({len([s for s in stations if fval.lower() in (s.get('name', '') + ' ' + s.get('tags', '')).lower()])} matches)" if fval else "Filter cleared"
             elif key in (9,):
                 load_tab((tab_idx + 1) % len(tabs))
-            elif ord("1") <= key <= ord("6"):
+            elif ord("1") <= key <= ord("7"):
                 n = key - ord("1")
                 if n == 5:
                     q = prompt_input(stdscr, "Search station: ")
@@ -756,6 +804,11 @@ def main_curses(stdscr):
                     load_tab(tab_idx, sel.get("value"))
                 else:
                     player.play(sel)
+                    remember_station(sel, recent)
+                    if tab_idx == 6:
+                        stations = list(recent)
+                        idx = 0
+                        scroll = 0
     finally:
         player.stop()
 

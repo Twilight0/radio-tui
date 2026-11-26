@@ -8,6 +8,7 @@ Lightweight single-file Python curses internet radio player with zero Python thi
   - **Favorites:** Bookmark any station or add custom stream URLs (`~/.config/radio-tui/favorites.json`).
   - **SomaFM:** All SomaFM channels via `somafm.com/channels.json`.
   - **Top World, Countries, Genres, Search:** Powered by the Radio Browser API (`radio-browser.info`) with lazy-loading pagination.
+  - **Recent:** Stations you have played, remembered in `~/.config/radio-tui/recent.json` (most recent first).
 - **Client-Side Filtering:** Filter loaded lists by substring (`l`) and clear with `Esc`.
 - **Audio Output & Mixing:** Decodes streams with `ffmpeg` and plays via PulseAudio/PipeWire (`paplay`) or ALSA `default` (`aplay`, compatible with `dmix` and BlueALSA).
 - **Volume Control:** Adjust volume directly with `+`/`-` (`pactl`, `bluealsa-cli`, or `amixer`).
@@ -45,7 +46,7 @@ python3 radio_tui.py
 | `/` | Search stations by name |
 | `c` | Jump to country (or browse all if blank) |
 | `g` | Jump to genre/tag (or browse all if blank) |
-| `1` - `6`, `Tab` | Switch tabs |
+| `1` - `7`, `Tab` | Switch tabs (`6` opens the search prompt, `7` shows recent stations) |
 | `Esc` / `Backspace` | Return from country/genre station list |
 | `q` | Quit (stops playback) |
 

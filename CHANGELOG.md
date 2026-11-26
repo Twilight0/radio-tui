@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.1.1 (2026-11-26)
+
+### Fixes
+
+- **Search prompt closed on the first keystroke:** `curses.KEY_TAB` does not exist in Python's curses module, so typing the first character raised `AttributeError` and the prompt was dismissed (the character was lost and the next keystroke was handled as a command). The tab key is now matched by its numeric code.
+
+### Features
+
+- **Recent stations tab (`7`):** stations you have played are remembered in `~/.config/radio-tui/recent.json` (most recent first, up to 50 entries) and listed in a new `Recent` tab. The list survives restarts and re-playing a station moves it back to the top.
+
 ## v1.1.0 (2026-11-26)
 
 ### Fixes
