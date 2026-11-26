@@ -5,20 +5,23 @@ Supports SomaFM, Radio Browser (40k+ worldwide stations), and custom favorites.
 Plays through PipeWire/PulseAudio or ALSA default (dmix / BlueALSA bridge).
 """
 
+import atexit
 import curses
+import ctypes
 import json
 import os
 import re
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 CONFIG_DIR = Path.home() / ".config" / "radio-tui"
 FAV_FILE = CONFIG_DIR / "favorites.json"
 USER_AGENT = f"radio-tui/{APP_VERSION}"
@@ -28,6 +31,45 @@ RADIO_BROWSER_HOSTS = [
     "https://fi1.api.radio-browser.info",
     "https://at1.api.radio-browser.info",
 ]
+
+
+PR_SET_PDEATHSIG = 1
+
+
+class Terminate(Exception):
+    """Raised from a signal handler to unwind and clean up."""
+
+    def __init__(self, signum):
+        super().__init__(signum)
+        self.signum = signum
+
+
+def _set_pdeathsig(sig=signal.SIGTERM):
+    """Ask the kernel to deliver `sig` to this process when its parent dies.
+
+    This is the safety net that guarantees the ffmpeg/paplay pipeline never
+    outlives radio-tui, even if radio-tui is SIGKILLed.
+    """
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        libc.prctl(PR_SET_PDEATHSIG, int(sig), 0, 0, 0)
+    except Exception:
+        pass
+
+
+def _child_preexec(pgid=None):
+    """preexec_fn for the audio children.
+
+    The child puts itself in its own process group (so we can signal the whole
+    pipeline at once) and sets PR_SET_PDEATHSIG so it dies with us.
+    """
+    def _fn():
+        try:
+            os.setpgid(0, 0 if pgid is None else pgid)
+        except Exception:
+            pass
+        _set_pdeathsig(signal.SIGTERM)
+    return _fn
 
 
 def _http_get_text(url, timeout=10):
@@ -218,22 +260,50 @@ class RadioPlayer:
         self._lock = threading.Lock()
         self._gen = 0
         self._pgid = None
+        self._procs = []
         self.state = "idle"
         self.station_name = ""
         self.error_msg = ""
+        atexit.register(self.stop)
 
-    def stop(self):
-        with self._lock:
-            self._gen += 1
-            pgid = self._pgid
-            self._pgid = None
-            self.state = "idle"
-            self.error_msg = ""
+    def _terminate(self, pgid, procs):
+        """Kill the audio pipeline: process group first, then the processes
+        themselves (the group may not exist yet if setpgid raced), then
+        escalate to SIGKILL for anything still alive."""
         if pgid:
             try:
                 os.killpg(pgid, signal.SIGTERM)
             except Exception:
                 pass
+        for p in procs:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+        for p in procs:
+            try:
+                p.wait(timeout=1.0)
+            except Exception:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+        if pgid:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except Exception:
+                pass
+
+    def stop(self):
+        with self._lock:
+            self._gen += 1
+            pgid = self._pgid
+            procs = list(self._procs)
+            self._pgid = None
+            self._procs = []
+            self.state = "idle"
+            self.error_msg = ""
+        self._terminate(pgid, procs)
 
     def play(self, station):
         self.stop()
@@ -247,6 +317,8 @@ class RadioPlayer:
         t.start()
 
     def _worker(self, gen, station):
+        ff_proc = None
+        ap_proc = None
         try:
             ffmpeg_bin = shutil.which("ffmpeg")
             paplay_bin = None
@@ -276,24 +348,38 @@ class RadioPlayer:
 
             ff_proc = subprocess.Popen(
                 ff_cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                preexec_fn=lambda: os.setpgid(0, 0),
+                preexec_fn=_child_preexec(),
             )
             ap_proc = subprocess.Popen(
                 ap_cmd, stdin=ff_proc.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                preexec_fn=lambda: os.setpgid(0, ff_proc.pid),
+                preexec_fn=_child_preexec(ff_proc.pid),
             )
             if ff_proc.stdout:
                 ff_proc.stdout.close()
 
+            # Do the same setpgid from the parent side: the child's own setpgid
+            # may not have run yet, and a stop() in that window would killpg an
+            # empty group and leave the pipeline running.
+            try:
+                os.setpgid(ff_proc.pid, ff_proc.pid)
+            except Exception:
+                pass
+            try:
+                os.setpgid(ap_proc.pid, ff_proc.pid)
+            except Exception:
+                pass
+
             with self._lock:
                 if self._gen != gen:
-                    try:
-                        os.killpg(ff_proc.pid, signal.SIGTERM)
-                    except Exception:
-                        pass
-                    return
-                self._pgid = ff_proc.pid
-                self.state = "playing"
+                    stale = True
+                else:
+                    stale = False
+                    self._pgid = ff_proc.pid
+                    self._procs = [ff_proc, ap_proc]
+                    self.state = "playing"
+            if stale:
+                self._terminate(ff_proc.pid, [ff_proc, ap_proc])
+                return
 
             _, ap_err = ap_proc.communicate()
             ff_err = ff_proc.stderr.read() if ff_proc.stderr else b""
@@ -310,18 +396,49 @@ class RadioPlayer:
                     else:
                         self.state = "idle"
                     self._pgid = None
+                    self._procs = []
+        except Terminate:
+            raise
         except Exception as e:
             with self._lock:
                 if self._gen == gen:
                     self.state = "error"
                     self.error_msg = str(e)[:80]
+            if ff_proc is not None or ap_proc is not None:
+                procs = [p for p in (ff_proc, ap_proc) if p is not None]
+                self._terminate(ff_proc.pid if ff_proc else None, procs)
+
+
+def _drain_input(stdscr, timeout=0.05, restore_timeout=250):
+    """Throw away anything already queued on the input stream.
+
+    Needed after ESC: a lone ESC and the start of an escape sequence (arrow
+    keys, function keys) are indistinguishable until the rest of the sequence
+    arrives.  Without draining, the tail of the sequence leaks into the main
+    loop and triggers random commands (e.g. "[A" -> "a" -> add-station prompt).
+    """
+    try:
+        stdscr.timeout(int(timeout * 1000))
+        while True:
+            if stdscr.getch() == -1:
+                break
+    except Exception:
+        pass
+    finally:
+        try:
+            stdscr.timeout(restore_timeout)
+        except Exception:
+            pass
 
 
 def prompt_input(stdscr, prompt):
     h, w = stdscr.getmaxyx()
     stdscr.timeout(-1)
     curses.noecho()
-    curses.curs_set(1)
+    try:
+        curses.curs_set(1)
+    except Exception:
+        pass
     buf = []
     try:
         while True:
@@ -334,19 +451,34 @@ def prompt_input(stdscr, prompt):
             stdscr.refresh()
             ch = stdscr.getch()
             if ch == 27:  # ESC cancels
+                _drain_input(stdscr, restore_timeout=-1)
                 return ""
             if ch in (10, 13, curses.KEY_ENTER):
                 return "".join(buf).strip()
             if ch in (curses.KEY_BACKSPACE, 127, 8):
                 if buf:
                     buf.pop()
-            elif 32 <= ch < 127 or ch >= 160:
+                continue
+            if ch in (9, curses.KEY_TAB):
+                continue
+            if ch < 0 or ch in (
+                curses.KEY_UP, curses.KEY_DOWN, curses.KEY_LEFT, curses.KEY_RIGHT,
+                curses.KEY_HOME, curses.KEY_END, curses.KEY_DC, curses.KEY_RESIZE,
+                curses.KEY_PPAGE, curses.KEY_NPAGE,
+            ):
+                continue
+            if 32 <= ch < 127 or ch >= 160:
                 if len(buf) < 120:
                     buf.append(chr(ch))
+    except Terminate:
+        raise
     except Exception:
         return ""
     finally:
-        curses.curs_set(0)
+        try:
+            curses.curs_set(0)
+        except Exception:
+            pass
         stdscr.timeout(250)
 
 
@@ -537,12 +669,17 @@ def main_curses(stdscr):
                 continue
             if key in (ord("q"), ord("Q")):
                 break
-            elif key == 27 and filter_text:
-                filter_text = ""
-                idx = 0
-                scroll = 0
-                msg = "Filter cleared"
-            elif key in (27, curses.KEY_BACKSPACE, 127, 8) and sub_label and tab_idx in (3, 4):
+            elif key == 27:
+                # ESC: cancel filter / leave a country or genre listing.
+                _drain_input(stdscr)
+                if filter_text:
+                    filter_text = ""
+                    idx = 0
+                    scroll = 0
+                    msg = "Filter cleared"
+                elif sub_label and tab_idx in (3, 4):
+                    load_tab(tab_idx)
+            elif key in (curses.KEY_BACKSPACE, 127, 8) and sub_label and tab_idx in (3, 4):
                 load_tab(tab_idx)
             elif key == curses.KEY_UP:
                 idx = max(0, idx - 1)
@@ -624,8 +761,28 @@ def main_curses(stdscr):
 
 
 def main():
-    curses.wrapper(main_curses)
+    # Make ESC snappy and let ncurses decode arrow/function keys reliably.
+    os.environ.setdefault("ESCDELAY", "100")
+
+    def _handler(signum, frame):
+        raise Terminate(signum)
+
+    for sig in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, _handler)
+        except Exception:
+            pass
+
+    try:
+        curses.wrapper(main_curses)
+    except Terminate as e:
+        # Signal received: the cleanup in main_curses' finally block has already
+        # stopped playback, so the terminal can be restored and we are done.
+        return 128 + e.signum
+    except KeyboardInterrupt:
+        return 130
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

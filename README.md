@@ -47,4 +47,7 @@ python3 radio_tui.py
 | `g` | Jump to genre/tag (or browse all if blank) |
 | `1` - `6`, `Tab` | Switch tabs |
 | `Esc` / `Backspace` | Return from country/genre station list |
-| `q` | Quit |
+| `q` | Quit (stops playback) |
+
+Playback is always tied to the app: closing the terminal tab, quitting or
+killing radio-tui also stops the stream (no orphaned `ffmpeg`/`paplay`).

@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.1.0 (2026-11-26)
+
+### Fixes
+
+- **Playback now always stops with the app:** `ffmpeg`/`paplay` are spawned with `PR_SET_PDEATHSIG`, so the audio pipeline dies with radio-tui even if it is `SIGKILL`ed; `SIGHUP`/`SIGTERM`/`SIGINT` are handled so closing a terminal tab no longer leaves an orphaned stream playing, and an `atexit` hook plus an explicit kill of the child processes back up the normal quit path.
+- **`s` (stop) can no longer miss:** the player now tracks the `ffmpeg`/`paplay` PIDs and terminates them directly, and the parent performs the `setpgid` itself, so a stop issued in the milliseconds right after playback starts no longer kills an empty process group and leaves the radio playing.
+- **Escape sequences no longer leak into keybindings:** arrow/function keys pressed while an input prompt is open used to cancel the prompt and then trigger random commands (e.g. `[A` -> `a` -> "add station" prompt). Pending input is now drained after `Esc`, and special keys are ignored inside prompts.
+- **More robust prompts:** `curs_set` failures are tolerated, `KEY_ENTER`/backspace/navigation keys behave consistently, and `Esc` reliably cancels a prompt.
+- **`Esc` in the main view** clears an active filter or leaves a country/genre listing instead of doing nothing.
+
 ## v1.0.0 (2026-11-22)
 
 ### Features
