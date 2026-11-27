@@ -21,7 +21,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 CONFIG_DIR = Path.home() / ".config" / "radio-tui"
 FAV_FILE = CONFIG_DIR / "favorites.json"
 RECENT_FILE = CONFIG_DIR / "recent.json"
@@ -234,11 +234,21 @@ def resolve_stream_url(station):
     return url
 
 
+def custom_country(url):
+    """Country label for manually added stations: YouTube links are marked
+    "Youtube", everything else stays "CUSTOM"."""
+    return "Youtube" if is_youtube_url(url) else "CUSTOM"
+
+
 def load_favorites():
     try:
         if FAV_FILE.exists():
             data = json.loads(FAV_FILE.read_text(encoding="utf-8"))
             if isinstance(data, list):
+                # Normalise entries added before YouTube links were labelled.
+                for entry in data:
+                    if isinstance(entry, dict) and entry.get("country") == "CUSTOM":
+                        entry["country"] = custom_country(entry.get("url", ""))
                 return data
     except Exception:
         pass
@@ -939,7 +949,7 @@ def main_curses(stdscr):
                 name = prompt_input(stdscr, "Station name: ")
                 url = prompt_input(stdscr, "Stream URL: ") if name else ""
                 if name and url:
-                    favs.append({"name": name, "url": url, "country": "CUSTOM", "tags": "", "bitrate": "", "codec": ""})
+                    favs.append({"name": name, "url": url, "country": custom_country(url), "tags": "", "bitrate": "", "codec": ""})
                     save_favorites(favs)
                     msg = f"Added {name} to Favorites"
                     if tab_idx == 0:

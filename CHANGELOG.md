@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.2.1 (2026-11-27)
+
+### Changes
+
+- Manually added YouTube stations are now labelled **"Youtube"** instead of "CUSTOM" in the country column. Existing entries are normalised the same way when the favorites file is loaded.
+
 ## v1.2.0 (2026-11-26)
 
 ### Features
